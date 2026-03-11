@@ -1,0 +1,21 @@
+2026-03-11 13:23:39 | package: mysql.connector.plugins
+2026-03-11 13:23:39 | plugin_name: mysql_native_password
+2026-03-11 13:23:39 | AUTHENTICATION_PLUGIN_CLASS: MySQLNativePasswordAuthPlugin
+2026-03-11 13:23:40 | CONNECTED | Params: ()
+2026-03-11 13:23:40 | DROP TABLE IF EXISTS users777 | Params: ()
+2026-03-11 13:23:40 | CREATE TABLE IF NOT EXISTS users777 (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100), age INT) | Params: ()
+2026-03-11 13:23:41 | INSERT INTO users777 (name, email, age) VALUES (%s, %s, %s) | Params: ['Alex', 'alex@test.com', 25]
+2026-03-11 13:23:41 | INSERT INTO users777 (name, email, age) VALUES (%s, %s, %s) | Params: ['Bob', 'bob@test.com', 30]
+2026-03-11 13:23:41 | INSERT INTO users777 (name, email, age) VALUES (%s, %s, %s) | Params: ['Anna', 'anna@test.com', 22]
+2026-03-11 13:23:42 | INSERT INTO users777 (name, email, age) VALUES (%s, %s, %s) | Params: ['Mike', 'mike@test.com', 28]
+2026-03-11 13:23:42 | INSERT INTO users777 (name, email, age) VALUES (%s, %s, %s) | Params: ['Kate', 'kate@test.com', 27]
+2026-03-11 13:23:42 | SELECT * FROM users777 ORDER BY name ASC | Params: ()
+2026-03-11 13:23:42 | SELECT * FROM users777 ORDER BY age DESC | Params: ()
+2026-03-11 13:23:43 | SELECT * FROM users777 WHERE id BETWEEN %s AND %s | Params: (1, 3)
+2026-03-11 13:23:43 | DELETE FROM users777 WHERE id BETWEEN %s AND %s | Params: (4, 5)
+2026-03-11 13:23:43 | DESCRIBE users777 | Params: ()
+2026-03-11 13:23:43 | SELECT * FROM users777 WHERE name = %s | Params: ('Alex',)
+2026-03-11 13:23:43 | ALTER TABLE users777 ADD city VARCHAR(100) | Params: ()
+2026-03-11 13:23:44 | ALTER TABLE users777 DROP COLUMN city | Params: ()
+2026-03-11 13:23:44 | SELECT * FROM users777 | Params: []
+2026-03-11 13:23:44 | INSERT INTO users777 (id, name, email, age) VALUES (%s, %s, %s, %s) | Params: [['1', 'Alex', 'alex@test.com', '25'], ['2', 'Bob', 'bob@test.com', '30'], ['3', 'Anna', 'anna@test.com', '22']]
