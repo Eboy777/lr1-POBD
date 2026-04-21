@@ -1,13 +1,21 @@
-import mysql.connector
 import logging
 import csv
 
 
 class SQLManager:
-    """класс для работы с MySQL"""
+    """Класс для работы с MySQL и PostgreSQL."""
     
-    def __init__(self, config, log_file='sql_queries.log'):
+    SUPPORTED_DBS = ('mysql', 'postgresql')
+    SUPPORTED_OPERATORS = {
+        '=', '!=', '<>', '>', '<', '>=', '<=', 'LIKE',
+        'BETWEEN', 'IN'
+    }
+
+    def __init__(self, config, db_type='mysql', log_file='sql_queries.log'):
         self.config = config
+        self.db_type = db_type.lower()
+        if self.db_type not in self.SUPPORTED_DBS:
+            raise ValueError(f"Unsupported db_type: {db_type}")
         self.connection = None
         self.cursor = None
         self._setup_logging(log_file)
@@ -24,11 +32,83 @@ class SQLManager:
     def _log(self, query, params=()):
         """Записать запрос в лог"""
         logging.info(f"{query} | Params: {params}")
+
+    def _to_dict_rows(self, rows):
+        """Привести строки к словарям (для PostgreSQL при обычном курсоре)."""
+        if not rows:
+            return rows
+        if isinstance(rows[0], dict):
+            return rows
+        if not self.cursor or not self.cursor.description:
+            return rows
+        columns = [desc[0] for desc in self.cursor.description]
+        return [dict(zip(columns, row)) for row in rows]
+
+    def _build_filter_clause(self, filters=None):
+        """Собрать WHERE-условие и параметры из словаря фильтров."""
+        if not filters:
+            return '', []
+
+        clauses = []
+        params = []
+
+        for column, condition in filters.items():
+            operator = '='
+            value = condition
+
+            if isinstance(condition, tuple) and len(condition) == 2:
+                operator, value = condition
+            elif isinstance(condition, dict):
+                operator = condition.get('op', '=')
+                value = condition.get('value')
+
+            operator = str(operator).upper().strip()
+            if operator not in self.SUPPORTED_OPERATORS:
+                raise ValueError(f"Unsupported operator: {operator}")
+
+            if operator == 'BETWEEN':
+                if not isinstance(value, (list, tuple)) or len(value) != 2:
+                    raise ValueError(f"BETWEEN requires 2 values for '{column}'")
+                clauses.append(f"{column} BETWEEN %s AND %s")
+                params.extend([value[0], value[1]])
+            elif operator == 'IN':
+                if not isinstance(value, (list, tuple, set)):
+                    raise ValueError(f"IN requires list/tuple/set for '{column}'")
+                values = list(value)
+                if not values:
+                    clauses.append("1=0")
+                else:
+                    placeholders = ', '.join(['%s'] * len(values))
+                    clauses.append(f"{column} IN ({placeholders})")
+                    params.extend(values)
+            else:
+                clauses.append(f"{column} {operator} %s")
+                params.append(value)
+
+        return ' AND '.join(clauses), params
     
     def connect(self):
         """Установить соединение с БД"""
-        self.connection = mysql.connector.connect(**self.config)
-        self.cursor = self.connection.cursor(dictionary=True)
+        if self.db_type == 'mysql':
+            import mysql.connector
+            self.connection = mysql.connector.connect(**self.config)
+            self.cursor = self.connection.cursor(dictionary=True)
+        else:
+            try:
+                import psycopg2
+                from psycopg2.extras import RealDictCursor
+                self.connection = psycopg2.connect(**self.config)
+                self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+            except ImportError:
+                try:
+                    import psycopg
+                    self.connection = psycopg.connect(**self.config)
+                    self.cursor = self.connection.cursor(row_factory=psycopg.rows.dict_row)
+                except ImportError as exc:
+                    raise ModuleNotFoundError(
+                        "PostgreSQL driver is not installed. "
+                        "Install one of: `pip install psycopg2-binary` or `pip install psycopg`"
+                    ) from exc
         self._log("CONNECTED", ())
     
     def disconnect(self):
@@ -62,11 +142,20 @@ class SQLManager:
         self.connection.commit()
     
     def describe_table(self, table):
-        """Вывести структуру таблицы (DESCRIBE)"""
-        query = f"DESCRIBE {table}"
-        self._log(query, ())
-        self.cursor.execute(query)
-        return self.cursor.fetchall()
+        """Вывести структуру таблицы"""
+        if self.db_type == 'mysql':
+            query = f"DESCRIBE {table}"
+            params = ()
+        else:
+            query = (
+                "SELECT column_name, data_type, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_name = %s ORDER BY ordinal_position"
+            )
+            params = (table,)
+        self._log(query, params)
+        self.cursor.execute(query, params)
+        return self._to_dict_rows(self.cursor.fetchall())
     
     # === КОЛОНКИ ===
     def add_column(self, table, name, dtype):
@@ -92,7 +181,7 @@ class SQLManager:
         self._log(query, list(data.values()))
         self.cursor.execute(query, list(data.values()))
         self.connection.commit()
-        return self.cursor.lastrowid
+        return getattr(self.cursor, 'lastrowid', None)
     
     def insert_many(self, table, rows):
         """Вставить несколько записей. Возвращает количество."""
@@ -108,15 +197,12 @@ class SQLManager:
         return self.cursor.rowcount
     
     # === SELECT ===
-    def select(self, table, columns='*', where=None, order_by=None, limit=None):
+    def select(self, table, columns='*', filters=None, order_by=None, limit=None):
         """Выбрать записи"""
         query = f"SELECT {columns} FROM {table}"
-        params = []
-        
-        if where:
-            conditions = ' AND '.join([f"{k} = %s" for k in where.keys()])
-            query += f" WHERE {conditions}"
-            params = list(where.values())
+        where_clause, params = self._build_filter_clause(filters)
+        if where_clause:
+            query += f" WHERE {where_clause}"
         
         if order_by:
             query += f" ORDER BY {order_by}"
@@ -126,63 +212,154 @@ class SQLManager:
         
         self._log(query, params)
         self.cursor.execute(query, params)
-        return self.cursor.fetchall()
+        return self._to_dict_rows(self.cursor.fetchall())
     
-    def select_one(self, table, columns='*', where=None):
+    def select_one(self, table, columns='*', filters=None):
         """Выбрать одну запись"""
-        results = self.select(table, columns, where, limit=1)
+        results = self.select(table, columns, filters=filters, limit=1)
         return results[0] if results else None
     
-    def select_sorted(self, table, column, order='ASC'):
+    def select_sorted(self, table, column, order='ASC', filters=None):
         """Выбрать отсортированные записи (ASC или DESC)"""
         order = order.upper()
         if order not in ('ASC', 'DESC'):
             order = 'ASC'
-        query = f"SELECT * FROM {table} ORDER BY {column} {order}"
-        self._log(query, ())
-        self.cursor.execute(query)
-        return self.cursor.fetchall()
+        query = f"SELECT * FROM {table}"
+        where_clause, params = self._build_filter_clause(filters)
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        query += f" ORDER BY {column} {order}"
+        self._log(query, params)
+        self.cursor.execute(query, params)
+        return self._to_dict_rows(self.cursor.fetchall())
     
-    def select_by_id_range(self, table, start_id, end_id):
+    def select_by_id_range(self, table, start_id, end_id, filters=None):
         """Выбрать диапазон строк по ID"""
         query = f"SELECT * FROM {table} WHERE id BETWEEN %s AND %s"
-        self._log(query, (start_id, end_id))
-        self.cursor.execute(query, (start_id, end_id))
-        return self.cursor.fetchall()
+        params = [start_id, end_id]
+        where_clause, where_params = self._build_filter_clause(filters)
+        if where_clause:
+            query += f" AND {where_clause}"
+            params.extend(where_params)
+        self._log(query, tuple(params))
+        self.cursor.execute(query, params)
+        return self._to_dict_rows(self.cursor.fetchall())
     
-    def select_where_column(self, table, column, value):
+    def select_where_column(self, table, column, value, operator='=', filters=None):
         """Выбрать строки содержащие значение в столбце"""
-        query = f"SELECT * FROM {table} WHERE {column} = %s"
-        self._log(query, (value,))
-        self.cursor.execute(query, (value,))
-        return self.cursor.fetchall()
+        query_filters = {column: (operator, value)}
+        if filters:
+            query_filters.update(filters)
+        return self.select(table, filters=query_filters)
+
+    # === JOIN ===
+    def select_join(
+        self,
+        left_table,
+        right_table,
+        on,
+        join_type='INNER',
+        columns='*',
+        filters=None,
+        order_by=None,
+        limit=None
+    ):
+        """Универсальный JOIN-запрос: INNER/LEFT/RIGHT/FULL/CROSS."""
+        join_type = {'FULL OUTER': 'FULL'}.get(join_type.upper(), join_type.upper())
+        if join_type not in ('INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS'):
+            raise ValueError(f"Unsupported join type: {join_type}")
+        if join_type != 'CROSS' and not on:
+            raise ValueError("Parameter 'on' is required for non-CROSS JOIN")
+
+        query = f"SELECT {columns} FROM {left_table} {join_type} JOIN {right_table}"
+        if on and join_type != 'CROSS':
+            query += f" ON {on}"
+
+        where_clause, params = self._build_filter_clause(filters)
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        if order_by:
+            query += f" ORDER BY {order_by}"
+        if limit:
+            query += f" LIMIT {limit}"
+
+        self._log(query, params)
+        self.cursor.execute(query, params)
+        return self._to_dict_rows(self.cursor.fetchall())
+
+    # === UNION ===
+    def select_union(self, select_specs, union_all=False, order_by=None, limit=None):
+        """
+        Выполнить UNION/UNION ALL.
+        select_specs = [
+            {'table': 'tours', 'columns': 'name', 'filters': {'price': ('>', 50000)}},
+            {'table': 'hotels', 'columns': 'name', 'filters': {'rating': 5}}
+        ]
+        """
+        if not select_specs or len(select_specs) < 2:
+            raise ValueError("select_specs must contain at least 2 SELECT parts")
+
+        parts = []
+        params = []
+        for spec in select_specs:
+            table = spec['table']
+            columns = spec.get('columns', '*')
+            filters = spec.get('filters')
+
+            part_query = f"SELECT {columns} FROM {table}"
+            where_clause, part_params = self._build_filter_clause(filters)
+            if where_clause:
+                part_query += f" WHERE {where_clause}"
+            parts.append(part_query)
+            params.extend(part_params)
+
+        union_keyword = 'UNION ALL' if union_all else 'UNION'
+        query = f" {union_keyword} ".join(parts)
+        if order_by:
+            query += f" ORDER BY {order_by}"
+        if limit:
+            query += f" LIMIT {limit}"
+
+        self._log(query, params)
+        self.cursor.execute(query, params)
+        return self._to_dict_rows(self.cursor.fetchall())
     
     # === UPDATE ===
-    def update(self, table, data, where):
+    def update(self, table, data, filters=None):
         """Обновить записи"""
         set_clause = ', '.join([f"{k} = %s" for k in data.keys()])
-        where_clause = ' AND '.join([f"{k} = %s" for k in where.keys()])
+        where_clause, where_params = self._build_filter_clause(filters)
+        if not where_clause:
+            raise ValueError("UPDATE requires at least one condition (filters)")
         query = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-        self._log(query, list(data.values()) + list(where.values()))
-        self.cursor.execute(query, list(data.values()) + list(where.values()))
+        params = list(data.values()) + where_params
+        self._log(query, params)
+        self.cursor.execute(query, params)
         self.connection.commit()
         return self.cursor.rowcount
     
     # === DELETE ===
-    def delete(self, table, where):
+    def delete(self, table, filters=None):
         """Удалить записи"""
-        where_clause = ' AND '.join([f"{k} = %s" for k in where.keys()])
+        where_clause, where_params = self._build_filter_clause(filters)
+        if not where_clause:
+            raise ValueError("DELETE requires at least one condition (filters)")
         query = f"DELETE FROM {table} WHERE {where_clause}"
-        self._log(query, list(where.values()))
-        self.cursor.execute(query, list(where.values()))
+        self._log(query, where_params)
+        self.cursor.execute(query, where_params)
         self.connection.commit()
         return self.cursor.rowcount
     
-    def delete_by_id_range(self, table, start_id, end_id):
+    def delete_by_id_range(self, table, start_id, end_id, filters=None):
         """Удалить диапазон строк по ID"""
         query = f"DELETE FROM {table} WHERE id BETWEEN %s AND %s"
-        self._log(query, (start_id, end_id))
-        self.cursor.execute(query, (start_id, end_id))
+        params = [start_id, end_id]
+        where_clause, where_params = self._build_filter_clause(filters)
+        if where_clause:
+            query += f" AND {where_clause}"
+            params.extend(where_params)
+        self._log(query, tuple(params))
+        self.cursor.execute(query, params)
         self.connection.commit()
         return self.cursor.rowcount
     
@@ -211,76 +388,186 @@ class SQLManager:
         
         return self.insert_many(table, rows)
 
-
-# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+# ===  ИСПОЛЬЗОВАНИЯ ===
 if __name__ == '__main__':
     db_config = {
-        'user': 'j30084097_13418',
-        'password': 'pPS090207/()',
-        'host': 'srv221-h-st.jino.ru',
-        'database': 'j30084097_13418'
+        'user': 'postgres',
+        'password': '1234',
+        'host': 'localhost',
+        'database': 'artemk',
+        'port': 5432
     }
     
-    with SQLManager(db_config) as db:
-        # Удалить старую таблицу если существует
-        db.drop_table('users777')
-        
-        # Создать таблицу users777 с 5 строками
-        db.create_table('users777', {
-            'id': 'INT AUTO_INCREMENT PRIMARY KEY',
-            'name': 'VARCHAR(100)',
-            'email': 'VARCHAR(100)',
-            'age': 'INT'
-        })
-        
-        # Вставка 5 записей
-        db.insert('users777', {'name': 'Alex', 'email': 'alex@test.com', 'age': 25})
-        db.insert('users777', {'name': 'Bob', 'email': 'bob@test.com', 'age': 30})
-        db.insert('users777', {'name': 'Anna', 'email': 'anna@test.com', 'age': 22})
-        db.insert('users777', {'name': 'Mike', 'email': 'mike@test.com', 'age': 28})
-        db.insert('users777', {'name': 'Kate', 'email': 'kate@test.com', 'age': 27})
-        
-        print("Таблица создана и заполнена 5 строками")
-        
-        # 1. Вывод столбца по возрастанию/убыванию
-        users_asc = db.select_sorted('users777', 'name', 'ASC')
-        print(f"\n1. Сортировка по имени (ASC): {[u['name'] for u in users_asc]}")
-        users_desc = db.select_sorted('users777', 'age', 'DESC')
-        print(f"1. Сортировка по возрасту (DESC): {[u['age'] for u in users_desc]}")
-        
-        # 2. Вывод диапазона по ID
-        users_range = db.select_by_id_range('users777', 1, 3)
-        print(f"\n2. Диапазон по ID (1-3): {len(users_range)} записей")
-        for u in users_range:
-            print(f"   ID: {u['id']}, Name: {u['name']}")
-        
-        # 3. Удаление диапазона по ID
-        deleted = db.delete_by_id_range('users777', 4, 5)
-        print(f"\n3. Удалено записей: {deleted}")
-        
-        # 4. Структура таблицы
-        structure = db.describe_table('users777')
-        print(f"\n4. Структура таблицы:")
-        for col in structure:
-            print(f"   {col['Field']} - {col['Type']}")
-        
-        # 5. Поиск по значению в столбце
-        users_named_alex = db.select_where_column('users777', 'name', 'Alex')
-        print(f"\n5. Поиск 'Alex': {len(users_named_alex)} записей")
-        
-        # 6. Удаление таблицы (раскомментировать для удаления)
-        # db.drop_table('users777')
-        # print("6. Таблица удалена")
-        
-        # 7. Добавление/удаление колонки
-        db.add_column('users777', 'city', 'VARCHAR(100)')
-        print("7. Колонка 'city' добавлена")
-        db.drop_column('users777', 'city')
-        print("7. Колонка 'city' удалена")
-        
-        # 8. Экспорт/импорт CSV
-        count = db.export_to_csv('users777', 'users777.csv')
-        print(f"\n8. Экспортировано: {count} записей в users777.csv")
-        
-        imported = db.import_from_csv('users777', 'users777.csv')
-        print(f"8. Импортировано: {imported} записей")
+    # Оставьте True для полного автотеста (пересоздание таблиц + заполнение).
+    # Поставьте False, если таблицы уже есть и хотите только проверить добавленные функции.
+    RESET_AND_SEED = True
+
+    with SQLManager(db_config, db_type='postgresql') as db:
+        if RESET_AND_SEED:
+            schema = {
+                'clients': {'id': 'SERIAL PRIMARY KEY', 'name': 'VARCHAR(100)', 'email': 'VARCHAR(100)', 'phone': 'VARCHAR(20)'},
+                'tours': {'id': 'SERIAL PRIMARY KEY', 'name': 'VARCHAR(200)', 'price': 'DECIMAL(10,2)', 'duration_days': 'INT'},
+                'bookings': {'id': 'SERIAL PRIMARY KEY', 'client_id': 'INT', 'tour_id': 'INT', 'booking_date': 'DATE'},
+                'hotels': {'id': 'SERIAL PRIMARY KEY', 'name': 'VARCHAR(150)', 'country': 'VARCHAR(100)', 'rating': 'INT'},
+                'guides': {'id': 'SERIAL PRIMARY KEY', 'name': 'VARCHAR(100)', 'language': 'VARCHAR(50)', 'phone': 'VARCHAR(20)'},
+                'transport': {'id': 'SERIAL PRIMARY KEY', 'type': 'VARCHAR(50)', 'capacity': 'INT', 'cost': 'DECIMAL(10,2)'},
+                'destinations': {'id': 'SERIAL PRIMARY KEY', 'country': 'VARCHAR(100)', 'city': 'VARCHAR(100)', 'description': 'TEXT'},
+                'payments': {'id': 'SERIAL PRIMARY KEY', 'booking_id': 'INT', 'amount': 'DECIMAL(10,2)', 'method': 'VARCHAR(50)'},
+                'reviews': {'id': 'SERIAL PRIMARY KEY', 'client_id': 'INT', 'tour_id': 'INT', 'rating': 'INT'}
+            }
+            data = {
+                'clients': [
+                    {'name': 'Иван Петров', 'email': 'ivan@test.com', 'phone': '+79001234567'},
+                    {'name': 'Мария Сидорова', 'email': 'maria@test.com', 'phone': '+79009876543'},
+                    {'name': 'Алексей Иванов', 'email': 'alex@test.com', 'phone': '+79005554433'},
+                    {'name': 'Елена Козлова', 'email': 'elena@test.com', 'phone': '+79003332211'}
+                ],
+                'tours': [
+                    {'name': 'Отдых в Турции', 'price': 50000.00, 'duration_days': 7},
+                    {'name': 'Тур в Египет', 'price': 45000.00, 'duration_days': 10},
+                    {'name': 'Отдых в Таиланде', 'price': 80000.00, 'duration_days': 14},
+                    {'name': 'Евротур', 'price': 120000.00, 'duration_days': 21}
+                ],
+                'bookings': [
+                    {'client_id': 1, 'tour_id': 1, 'booking_date': '2025-06-15'},
+                    {'client_id': 2, 'tour_id': 2, 'booking_date': '2025-07-01'},
+                    {'client_id': 3, 'tour_id': 3, 'booking_date': '2025-08-10'},
+                    {'client_id': 4, 'tour_id': 4, 'booking_date': '2025-09-05'}
+                ],
+                'hotels': [
+                    {'name': 'Grand Hotel 5*', 'country': 'Турция', 'rating': 5},
+                    {'name': 'Sea Resort 4*', 'country': 'Египет', 'rating': 4},
+                    {'name': 'Tropical Paradise 5*', 'country': 'Таиланд', 'rating': 5},
+                    {'name': 'City Center 3*', 'country': 'Италия', 'rating': 3}
+                ],
+                'guides': [
+                    {'name': 'Ахмед Хасан', 'language': 'арабский', 'phone': '+201001112233'},
+                    {'name': 'Ольга Смирнова', 'language': 'русский', 'phone': '+79001112233'},
+                    {'name': 'John Smith', 'language': 'английский', 'phone': '+442012345678'},
+                    {'name': 'Мария Гончарова', 'language': 'испанский', 'phone': '+34911223344'}
+                ],
+                'transport': [
+                    {'type': 'Самолёт', 'capacity': 200, 'cost': 15000.00},
+                    {'type': 'Автобус', 'capacity': 50, 'cost': 5000.00},
+                    {'type': 'Микроавтобус', 'capacity': 18, 'cost': 3000.00},
+                    {'type': 'Яхта', 'capacity': 12, 'cost': 25000.00}
+                ],
+                'destinations': [
+                    {'country': 'Турция', 'city': 'Анталья', 'description': 'Курортный город на Средиземном море'},
+                    {'country': 'Египет', 'city': 'Шарм-эль-Шейх', 'description': 'Курорт на Красном море'},
+                    {'country': 'Таиланд', 'city': 'Пхукет', 'description': 'Остров в Андаманском море'},
+                    {'country': 'Италия', 'city': 'Рим', 'description': 'Столица Италии, город вечности'}
+                ],
+                'payments': [
+                    {'booking_id': 1, 'amount': 50000.00, 'method': 'карта'},
+                    {'booking_id': 2, 'amount': 45000.00, 'method': 'наличные'},
+                    {'booking_id': 3, 'amount': 80000.00, 'method': 'перевод'},
+                    {'booking_id': 4, 'amount': 120000.00, 'method': 'карта'}
+                ],
+                'reviews': [
+                    {'client_id': 1, 'tour_id': 1, 'rating': 5},
+                    {'client_id': 2, 'tour_id': 2, 'rating': 4},
+                    {'client_id': 3, 'tour_id': 3, 'rating': 5},
+                    {'client_id': 4, 'tour_id': 4, 'rating': 3}
+                ]
+            }
+            tables = ['clients', 'tours', 'bookings', 'hotels', 'guides', 'transport', 'destinations', 'payments', 'reviews']
+            for table in reversed(tables):
+                db.drop_table(table)
+            for table in tables:
+                db.create_table(table, schema[table])
+                db.insert_many(table, data[table])
+            print("Заполнено данными 9 таблиц")
+        # Если не нужно пересоздавать и заполнять таблицы, просто используйте RESET_AND_SEED = False.
+
+        print("\nФильтрация (price >= 50000 и duration 7..14):")
+        filtered_tours = db.select(
+            'tours',
+            filters={
+                'price': ('>=', 50000),
+                'duration_days': ('BETWEEN', (7, 14))
+            },
+            order_by='price DESC'
+        )
+        for row in filtered_tours:
+            print(row)
+
+        print("\nINNER JOIN bookings + clients:")
+        inner_rows = db.select_join(
+            'bookings b',
+            'clients c',
+            on='b.client_id = c.id',
+            join_type='INNER',
+            columns='b.id AS booking_id, c.name AS client_name, b.booking_date',
+            order_by='b.id'
+        )
+        for row in inner_rows:
+            print(row)
+
+        print("\nLEFT JOIN clients + reviews:")
+        left_rows = db.select_join(
+            'clients c',
+            'reviews r',
+            on='c.id = r.client_id',
+            join_type='LEFT',
+            columns='c.name, r.rating',
+            order_by='c.id'
+        )
+        for row in left_rows:
+            print(row)
+
+        print("\nRIGHT JOIN bookings + tours:")
+        right_rows = db.select_join(
+            'bookings b',
+            'tours t',
+            on='b.tour_id = t.id',
+            join_type='RIGHT',
+            columns='t.name AS tour_name, b.booking_date',
+            order_by='t.id'
+        )
+        for row in right_rows:
+            print(row)
+
+        print("\nFULL JOIN reviews + tours:")
+        full_rows = db.select_join(
+            'reviews r',
+            'tours t',
+            on='r.tour_id = t.id',
+            join_type='FULL',
+            columns='t.name AS tour_name, r.rating',
+            order_by='tour_name'
+        )
+        for row in full_rows:
+            print(row)
+
+        print("\nCROSS JOIN clients + transport (5 строк):")
+        cross_rows = db.select_join(
+            'clients c',
+            'transport tr',
+            on=None,
+            join_type='CROSS',
+            columns='c.name AS client_name, tr.type AS transport_type',
+            limit=5
+        )
+        for row in cross_rows:
+            print(row)
+
+        print("\nUNION ALL clients + guides:")
+        union_rows = db.select_union(
+            [
+                {
+                    'table': 'clients',
+                    'columns': "name AS entity_name, 'client' AS source",
+                    'filters': {'id': ('IN', [1, 2])}
+                },
+                {
+                    'table': 'guides',
+                    'columns': "name AS entity_name, 'guide' AS source",
+                    'filters': {'id': ('IN', [1, 2])}
+                }
+            ],
+            union_all=True,
+            order_by='entity_name'
+        )
+        for row in union_rows:
+            print(row)
